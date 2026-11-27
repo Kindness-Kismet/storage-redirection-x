@@ -52,7 +52,7 @@ jobs:
         shell: bash
         env:
           SOURCE_TOKEN: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
-          SOURCE_REPOSITORY: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
+          SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
           SOURCE_REF: ${{ inputs.source_ref || vars.PRIVATE_SOURCE_REF }}
         run: |
           set -euo pipefail
@@ -61,18 +61,39 @@ jobs:
             exit 1
           fi
           : "${SOURCE_TOKEN:?Configure the PRIVATE_SOURCE_TOKEN Secret}"
-          : "${SOURCE_REPOSITORY:?Configure the PRIVATE_SOURCE_REPOSITORY Variable}"
+          : "${SOURCE_REPOSITORY:?Configure the PRIVATE_SOURCE_REPOSITORY Secret}"
           : "${SOURCE_REF:?Configure PRIVATE_SOURCE_REF or provide source_ref}"
 
       - name: Check out private source
         uses: actions/checkout@v7.0.0
         with:
-          repository: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
+          repository: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
           ref: ${{ inputs.source_ref || vars.PRIVATE_SOURCE_REF }}
           token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
           show-progress: false
+
+      - name: Fetch previous source revision
+        if: inputs.previous_source_ref != '' && inputs.previous_source_ref != '0000000000000000000000000000000000000000'
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          PREVIOUS_SOURCE_REF: ${{ inputs.previous_source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PREVIOUS_SOURCE_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::previous_source_ref must be a full commit SHA.'
+            exit 1
+          fi
+          authorization="$(printf 'x-access-token:%s' "${SOURCE_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${authorization}"
+          if ! git -c "http.extraheader=AUTHORIZATION: basic ${authorization}" fetch \
+              --no-tags --no-recurse-submodules --depth=1 origin "${PREVIOUS_SOURCE_REF}" \
+              > "${RUNNER_TEMP}/private-history.log" 2>&1; then
+            echo '::error::Cannot fetch the previous private revision.'
+            exit 1
+          fi
 
       - name: Pin private source commit
         id: source
@@ -164,7 +185,7 @@ jobs:
       - name: Check out pinned private source
         uses: actions/checkout@v7.0.0
         with:
-          repository: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
+          repository: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
           ref: ${{ needs.prepare.outputs.source_sha }}
           token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
           persist-credentials: false
@@ -243,9 +264,12 @@ jobs:
           done
           keystore_path="${RUNNER_TEMP}/release.jks"
           printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
-          keytool -list -keystore "${keystore_path}" \
-            -storepass:env ANDROID_KEYSTORE_PASSWORD \
-            -alias "${ANDROID_KEY_ALIAS}" > /dev/null
+          if ! keytool -list -keystore "${keystore_path}" \
+              -storepass:env ANDROID_KEYSTORE_PASSWORD \
+              -alias "${ANDROID_KEY_ALIAS}" > "${RUNNER_TEMP}/private-signing.log" 2>&1; then
+            echo '::error::Cannot read the release signing key.'
+            exit 1
+          fi
           echo "keystore_path=${keystore_path}" >> "${GITHUB_OUTPUT}"
 
       - name: Build release Zygisk module
@@ -298,7 +322,11 @@ jobs:
           if os.environ['RELEASE_TAG'].startswith('v'):
               apk = Path(f'build/apk/Storage-Redirect-X_{app_version}_{abi}.apk')
               tools = Path(os.environ['ANDROID_SDK_ROOT']) / 'build-tools/36.0.0'
-              subprocess.run([str(tools / 'apksigner'), 'verify', str(apk)], check=True)
+              with (Path(os.environ['RUNNER_TEMP']) / 'private-apk-signature.log').open('wb') as signature_log:
+                  signature = subprocess.run([str(tools / 'apksigner'), 'verify', str(apk)],
+                                             stdout=signature_log, stderr=subprocess.STDOUT)
+              if signature.returncode:
+                  raise SystemExit('APK signature verification failed')
               badging = subprocess.check_output([str(tools / 'aapt'), 'dump', 'badging', str(apk)], text=True)
               version = re.search(r"versionCode='([^']+)' versionName='([^']+)'", badging)
               if version is None or version.groups() != (os.environ['APP_VERSION_CODE'], app_version):
@@ -336,7 +364,7 @@ jobs:
       - name: Check out pinned private release tools
         uses: actions/checkout@v7.0.0
         with:
-          repository: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
+          repository: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
           ref: ${{ needs.prepare.outputs.source_sha }}
           token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
           persist-credentials: false
