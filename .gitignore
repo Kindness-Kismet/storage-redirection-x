@@ -9,6 +9,9 @@
 !/Cargo.toml
 !/Cargo.lock
 
+# 模块管理器固定读取的公开更新信息，由发布流程维护。
+!/update.json
+
 # 项目技能入口，只放行这一份配置。
 !/.pi/
 !/.pi/settings.json

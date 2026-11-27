@@ -16,7 +16,7 @@ on:
         required: false
         type: string
       publish_release:
-        description: 'Publish a Release; automatic private pushes require a version change'
+        description: 'Publish only when a component version is newer than published releases'
         required: true
         type: boolean
         default: true
@@ -45,7 +45,7 @@ jobs:
       core_version: ${{ steps.version.outputs.core_version }}
       tag: ${{ steps.release.outputs.tag }}
       publish_release: ${{ steps.release.outputs.publish_release }}
-      changelog_base64: ${{ steps.changelog.outputs.changelog_base64 }}
+      publish_feed: ${{ steps.release.outputs.publish_feed }}
 
     steps:
       - name: Check branch and private source access
@@ -96,49 +96,33 @@ jobs:
 
       - name: Select release tag and publication mode
         id: release
-        shell: python
+        shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.tag }}
           PREVIOUS_SOURCE_REF: ${{ inputs.previous_source_ref }}
           REQUEST_PUBLISH: ${{ inputs.publish_release }}
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
-          APP_VERSION_CODE: ${{ steps.version.outputs.app_version_code }}
-          CORE_VERSION: ${{ steps.version.outputs.core_version }}
         run: |
-          import os
-          import re
-          import subprocess
-          import tomllib
+          set -euo pipefail
+          if ! python scripts/module_update.py select-release \
+              --previous-source-ref "${PREVIOUS_SOURCE_REF}" --tag "${INPUT_TAG}" \
+              --request-publish "${REQUEST_PUBLISH}" --output build/ci/release-plan.json \
+              --github-output "${GITHUB_OUTPUT}" > "${RUNNER_TEMP}/private-release-plan.log" 2>&1; then
+            echo '::error::Cannot select a release. Review component versions and the requested tag privately.'
+            exit 1
+          fi
 
-          app_tag = f"v{os.environ['APP_VERSION']}"
-          core_tag = f"core-{os.environ['CORE_VERSION']}"
-          tag = os.environ['INPUT_TAG']
-          should_publish = os.environ['REQUEST_PUBLISH'] == 'true'
-
-          previous = os.environ['PREVIOUS_SOURCE_REF']
-          if previous and previous != '0' * 40:
-              if re.fullmatch(r'[0-9a-f]{40}', previous) is None:
-                  raise SystemExit('previous_source_ref must be a full commit SHA')
-              properties = subprocess.check_output(
-                  ['git', 'show', f'{previous}:android/gradle.properties'], text=True)
-              previous_app = dict(line.strip().split('=', 1) for line in properties.splitlines() if '=' in line)
-              manifest = subprocess.check_output(
-                  ['git', 'show', f'{previous}:srx_core/Cargo.toml'], text=True)
-              previous_core = tomllib.loads(manifest)['package']['version']
-              app_changed = (previous_app['appVersionName'] != os.environ['APP_VERSION'] or
-                             previous_app['appVersionCode'] != os.environ['APP_VERSION_CODE'])
-              core_changed = previous_core != f"{os.environ['CORE_VERSION']}.0.0"
-              if not tag:
-                  tag = app_tag if app_changed or not core_changed else core_tag
-                  should_publish = should_publish and (app_changed or core_changed)
-          tag = tag or app_tag
-          if tag not in (app_tag, core_tag):
-              raise SystemExit(f'Release tag must match {app_tag} or {core_tag}')
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              output.write(f'tag={tag}\npublish_release={str(should_publish).lower()}\n')
+      - name: Preserve release plan
+        if: steps.release.outputs.publish_release == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-plan
+          path: build/ci/release-plan.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
 
       - name: Read release notes and write summary
-        id: changelog
         shell: bash
         env:
           APP_VERSION: ${{ steps.version.outputs.app_version }}
@@ -149,7 +133,6 @@ jobs:
         run: |
           set -euo pipefail
           test -s .github/CHANGELOG.md
-          printf 'changelog_base64=%s\n' "$(base64 -w 0 .github/CHANGELOG.md)" >> "${GITHUB_OUTPUT}"
           {
             printf '# Storage Redirect X\n\n'
             printf 'APK: %s\n\nCore: %s\n\nTag: %s\n\n' "${APP_VERSION}" "${CORE_VERSION}" "${RELEASE_TAG}"
@@ -350,6 +333,26 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out pinned private release tools
+        uses: actions/checkout@v7.0.0
+        with:
+          repository: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          show-progress: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.x'
+
+      - name: Download release plan
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-plan
+          path: build/ci/
+
       - name: Download release packages
         uses: actions/download-artifact@v8.0.1
         with:
@@ -357,82 +360,38 @@ jobs:
           path: build/ci/artifacts/
           merge-multiple: true
 
-      - name: Check complete release package set
-        shell: python
-        env:
-          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
-          CORE_VERSION: ${{ needs.prepare.outputs.core_version }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      - name: Prepare verified universal module and release assets
+        shell: bash
         run: |
-          import os
-          from pathlib import Path
+          set -euo pipefail
+          if ! python scripts/module_update.py prepare --plan build/ci/release-plan.json \
+              --packages build/ci/artifacts --changelog .github/CHANGELOG.md \
+              --output build/ci/release > "${RUNNER_TEMP}/private-release-prepare.log" 2>&1; then
+            echo '::error::Release preparation failed. Review the package validation privately.'
+            exit 1
+          fi
 
-          expected = set()
-          for abi in ('arm64-v8a', 'x86_64'):
-              expected.add(f"Storage-Redirect-X_v{os.environ['CORE_VERSION']}-{abi}.zip")
-              if os.environ['RELEASE_TAG'].startswith('v'):
-                  expected.add(f"Storage-Redirect-X_{os.environ['APP_VERSION']}_{abi}.apk")
-          packages = list(Path('build/ci/artifacts').iterdir())
-          if {path.name for path in packages} != expected:
-              raise SystemExit('Release packages do not match the complete target matrix')
-          if any(not path.is_file() or path.stat().st_size == 0 for path in packages):
-              raise SystemExit('Release packages must be non-empty files')
-          print(f'Validated {len(packages)} release packages')
-
-      - name: Create tag and publish verified packages
-        shell: python
+      - name: Publish verified release assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          CHANGELOG_BASE64: ${{ needs.prepare.outputs.changelog_base64 }}
         run: |
-          import base64
-          import json
-          import os
-          import re
-          import subprocess
-          from pathlib import Path
+          set -euo pipefail
+          if ! python scripts/module_update.py publish-release --prepared build/ci/release \
+              --public-sha "${GITHUB_SHA}" > "${RUNNER_TEMP}/private-release-publish.log" 2>&1; then
+            echo '::error::Release publication failed. The module feed has not been advanced.'
+            exit 1
+          fi
 
-          def gh(*args):
-              result = subprocess.run(['gh', *args], check=True, capture_output=True, text=True)
-              return result.stdout
-
-          tag = os.environ['RELEASE_TAG']
-          public_sha = os.environ['GITHUB_SHA']
-          repository = os.environ['GH_REPO']
-          refs = json.loads(gh('api', f'repos/{repository}/git/matching-refs/tags/{tag}'))
-          ref = next((item for item in refs if item['ref'] == f'refs/tags/{tag}'), None)
-          if ref is not None:
-              target = ref['object']
-              while target['type'] == 'tag':
-                  target = json.loads(gh('api', f"repos/{repository}/git/tags/{target['sha']}"))['object']
-              if target['sha'] != public_sha:
-                  raise SystemExit('Existing release tag points to a different public workflow commit')
-          else:
-              gh('api', '--method', 'POST', f'repos/{repository}/git/refs',
-                 '-f', f'ref=refs/tags/{tag}', '-f', f'sha={public_sha}')
-          releases = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repository}/releases?per_page=100'))
-          release = next((item for page in releases for item in page if item['tag_name'] == tag), None)
-          if release is not None and not release['draft']:
-              raise SystemExit('Release is already public; existing packages will not be overwritten')
-          notes = Path(os.environ['RUNNER_TEMP']) / 'release-notes.md'
-          notes.write_bytes(base64.b64decode(os.environ['CHANGELOG_BASE64'], validate=True))
-          if not notes.read_text(encoding='utf-8').strip():
-              raise SystemExit('Release notes must not be empty')
-          title = f'Storage Redirect X {tag}'
-          is_prerelease = re.fullmatch(r'v\d+\.\d+\.\d+-beta\d+', tag) is not None
-          flags = ['--title', title, '--notes-file', str(notes), f'--prerelease={str(is_prerelease).lower()}']
-          if release is None:
-              gh('release', 'create', tag, '--verify-tag', '--draft', *flags)
-          else:
-              gh('release', 'edit', tag, *flags)
-          packages = sorted(Path('build/ci/artifacts').iterdir())
-          gh('release', 'upload', tag, *(str(path) for path in packages), '--clobber')
-          uploaded = json.loads(gh('release', 'view', tag, '--json', 'assets'))['assets']
-          expected = {path.name: path.stat().st_size for path in packages}
-          if {item['name']: item['size'] for item in uploaded} != expected:
-              raise SystemExit('Uploaded release assets do not match the validated package set')
-          make_latest = tag.startswith('v') and not is_prerelease
-          gh('release', 'edit', tag, '--draft=false', f'--latest={str(make_latest).lower()}')
-          print(gh('release', 'view', tag, '--json', 'url', '--jq', '.url').strip())
+      - name: Publish module update feed
+        if: needs.prepare.outputs.publish_feed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! python scripts/module_update.py publish-feed --prepared build/ci/release \
+              > "${RUNNER_TEMP}/private-module-feed.log" 2>&1; then
+            echo '::error::Module feed publication failed. Review the published release privately before retrying.'
+            exit 1
+          fi
